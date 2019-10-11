@@ -1,0 +1,392 @@
+/*
+ * Copyright 2011 - Churn Labs, LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * This is mostly based off of the FFMPEG tutorial:
+ * http://dranger.com/ffmpeg/
+ * With a few updates to support Android output mechanisms and to update
+ * places where the APIs have shifted.
+ */
+#include <stdio.h>
+#include <errno.h>
+#include <sys/types.h>	
+#include <sys/stat.h>	
+#include <linux/fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>    
+#include <stdint.h>
+#include <stdlib.h>
+#include <asm/types.h>
+#include <linux/videodev2.h>
+#include <sys/mman.h>
+#include <string.h>
+#include <malloc.h>
+#include <sys/poll.h> 
+#include <linux/fb.h>
+#include <time.h>
+
+/* ################################## */
+/* step1 */
+#include "libve_enc.h"
+VencBaseConfig baseConfig;
+VencAllocateBufferParam bufferParam;
+VencHeaderData sps_pps_data;
+VencH264Param h264Param;
+VideoEncoder* pVideoEnc = NULL;
+int bcount=1;
+int fps_value=0;
+int picWidth =0;
+int picHeight =0;
+/* ################################## */
+
+struct fimc_buffer {
+    unsigned char *start;
+    size_t  length;
+};
+
+static int fd = -1;
+struct fimc_buffer *buffers=NULL;
+struct v4l2_buffer v4l2_buf;
+static int bufnum = 1;
+static int mwidth,mheight;
+
+static int fd2 = -1;
+struct fimc_buffer *buffers2=NULL;
+struct v4l2_buffer v4l2_buf2;
+static int bufnum2 = 1;
+static int mwidth2,mheight2;
+
+fd_set fds;
+struct timeval tv;
+int fdsret;
+int maxfd = 0;
+int cnt = 0;
+
+/* 1.open csi camera device */
+int open_select_input(int devid)
+{
+	char* devname =NULL;
+	switch(devid){
+		case 0:
+			devname = "/dev/video0";
+			break;
+		case 1:
+			devname = "/dev/video1";
+			break;
+		case 2:
+			devname = "/dev/video2";
+			break;
+		case 3:
+			devname = "/dev/video3";
+			break;
+		default:
+			devname = "/dev/video1";
+			break;
+	}
+	fd = open(devname, O_RDWR, 0);
+	if (fd < 0)
+		printf(">>>>>%s open error\n",devname);
+
+	/* bbc new add */
+	struct v4l2_input inp;
+	inp.index = devid;
+    if (-1 == ioctl (fd, VIDIOC_S_INPUT, &inp)){
+        printf("VIDIOC_S_INPUT %d error!\n",devid);
+        return -1;
+    }
+	return fd;
+}
+
+/* 2.init device and alloc memory */
+int v4l2_init(int width, int height, int numbuf)
+{
+	int i, ret;
+	bufnum = numbuf;
+	mwidth = width;
+	mheight = height;
+
+	/* set v4l2_format */
+	struct v4l2_format fmt;	
+	memset( &fmt, 0, sizeof(struct v4l2_format));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+	fmt.fmt.pix.width = width;
+	fmt.fmt.pix.height = height;					
+	if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+	{
+		printf(">>>>>%d : set format failed\n",__LINE__);
+		return -1;
+	}
+
+/* ####################################################### */
+	/* step2 bbc *//* 20160418 add */
+	if(width ==1280 && height ==720){
+		picWidth  = 1280;
+		picHeight = 720;
+		fps_value = 60;
+	}else if(width ==1280 && height ==721){
+		picWidth  = 1280;
+		picHeight = 720;
+		fps_value = 50;
+	}else if(width ==1920 && height ==1080){
+		picWidth  = 1920;
+		picHeight = 1080;
+		fps_value = 25;
+	}else if(width ==1360 && height ==768){	
+		picWidth  = 1360;
+		picHeight = 768;
+		fps_value = 60;
+	}
+/* ###################################################### */
+
+	/* request buffers */
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(struct v4l2_requestbuffers));
+    req.count = numbuf;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    ret = ioctl(fd, VIDIOC_REQBUFS, &req);
+    if (ret < 0) {
+        printf(">>>>>%d :VIDIOC_REQBUFS failed\n",__LINE__);
+        return -1;
+    }
+
+    printf("%d :numbuf = %d\n",__LINE__, req.count);
+    buffers = calloc(req.count, sizeof(*buffers));
+    if (!buffers) {
+        printf (">>>>>%d :Out of memory\n",__LINE__);
+		return -1;
+    }
+
+	for(i = 0; i < bufnum; ++i) {
+		memset(&v4l2_buf, 0, sizeof(struct v4l2_buffer));
+		v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		v4l2_buf.memory = V4L2_MEMORY_MMAP;
+		v4l2_buf.index = i;
+		ret = ioctl(fd , VIDIOC_QUERYBUF, &v4l2_buf);
+		if(ret < 0) {
+		   printf(">>>>>%d :VIDIOC_QUERYBUF failed\n",__LINE__);
+		   return -1;
+		}
+		buffers[i].length = v4l2_buf.length;
+		if ((buffers[i].start = (char *)mmap(0, v4l2_buf.length,
+		                                     PROT_READ | PROT_WRITE, MAP_SHARED,
+		                                     fd, v4l2_buf.m.offset)) < 0) {
+		     printf(">>>>>%d :mmap() failed",__LINE__);
+		     return -1;
+		}
+	}
+
+	for (i = 0; i < bufnum; ++i) {
+		memset(&v4l2_buf, 0, sizeof(struct v4l2_buffer));
+		v4l2_buf.index = i;
+		v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		v4l2_buf.memory = V4L2_MEMORY_MMAP;
+		ret = ioctl(fd, VIDIOC_QBUF, &v4l2_buf);
+		if (ret < 0) {
+			printf(">>>>>%d :VIDIOC_QBUF failed\n",__LINE__);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+
+/* 3.get one frame data */
+int v4l2_dqbuf(int fps)
+{
+    int ret;	
+   	char data[1280*720*3/2];
+    v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_buf.memory = V4L2_MEMORY_MMAP;
+
+    ret = ioctl(fd, VIDIOC_DQBUF, &v4l2_buf);
+    if (ret < 0) {
+        printf(">>>>>%s :VIDIOC_DQBUF failed, dropped frame 3\n",__func__);
+        return ret;
+    }
+	cnt++;
+
+/* ########################################################################################################################### */
+	/* step5 bbc */
+	if(fps ==60){
+		switch(bcount)
+		{
+			case 1: bcount =2;
+					libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+					break;
+			case 2: bcount =3; break;
+			case 3: bcount =4; 
+					libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+					break;
+			case 4: bcount =5; break;
+			case 5: bcount =1; break;
+		}
+	}else if(fps ==50){
+		if((cnt%2)) 
+			libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+	}else if(fps ==25){
+		libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+	}
+/* ########################################################################################################################### */
+	return v4l2_buf.index;
+}
+
+
+/* 4.put the buffer to queue */
+int v4l2_qbuf(int index)
+{
+    int ret;
+    v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_buf.memory = V4L2_MEMORY_MMAP;
+    v4l2_buf.index = index;
+
+    ret = ioctl(fd, VIDIOC_QBUF, &v4l2_buf);
+    if (ret < 0) {
+        printf(">>>>>%s :VIDIOC_QBUF failed\n",__func__);
+        return ret;
+    }
+    return 0;
+}
+
+/* 5.stream on */
+int v4l2_stream_on(void)
+{
+	int i, ret;
+	int iType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ret = ioctl(fd, VIDIOC_STREAMON, &iType);
+    if (ret < 0) {
+        printf(">>>>>%d :VIDIOC_STREAMON failed\n",__LINE__);
+        return ret;
+    }
+	return 0;
+}
+
+/* 6.stream off */
+int v4l2_stream_off(void)
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    int ret;
+
+    ret = ioctl(fd, VIDIOC_STREAMOFF, &type);
+    if (ret < 0) {
+        printf(">>>>>%s :VIDIOC_STREAMOFF failed\n",__func__);
+        return ret;
+    }
+    return 0;
+}
+
+/* h264 encoder configration */
+static int config_h264_encoder()
+{
+/* ######################################################################## */
+   	//the basic configration for init encoder
+    memset(&baseConfig, 0 ,sizeof(VencBaseConfig));
+    baseConfig.nInputWidth= picWidth;
+    baseConfig.nInputHeight = picHeight;
+    baseConfig.nStride = picWidth;  //(picWidth + 15) & 0xfffffff0;
+    baseConfig.nDstWidth = picWidth;
+    baseConfig.nDstHeight = picHeight;
+    baseConfig.eInputFormat = VENC_PIXEL_YUV420P;
+
+	//alloc frame memory's configration
+    memset(&bufferParam, 0 ,sizeof(VencAllocateBufferParam));
+    bufferParam.nSizeY = baseConfig.nInputWidth*baseConfig.nInputHeight;
+    bufferParam.nSizeC = baseConfig.nInputWidth*baseConfig.nInputHeight/2;
+    bufferParam.nBufferNum = 4;
+
+    //h264 param
+    h264Param.bEntropyCodingCABAC = 1;
+    h264Param.nBitrate = 2*1024*1024; /* bps */
+    h264Param.nFramerate = 25; /* fps */
+    h264Param.nCodingMode = VENC_FRAME_CODING;
+    h264Param.nMaxKeyInterval = 30;
+    h264Param.sProfileLevel.nProfile = VENC_H264ProfileMain;
+    h264Param.sProfileLevel.nLevel = VENC_H264Level31;
+    h264Param.sQPRange.nMinqp = 10;
+    h264Param.sQPRange.nMaxqp = 40;
+	if(libveENC_init(&pVideoEnc, &baseConfig, &h264Param) != -1){
+    	printf("1.>>>>> libveENC_init done!\n");
+        handleBeforeJob();
+	}
+	return 0;
+/* ########################################################################## */
+}
+
+/* test main function */
+int main() 
+{
+	int i, ret;
+	char* p =NULL;
+	clock_t start;
+	clock_t stop;
+
+	ret = open_select_input(0);
+	if (ret < 0) {
+		printf(">>>>> :no this devices\n");
+	}
+
+	/* step2 bbc */
+	ret = v4l2_init(1280, 720, 10);
+	if (ret < 0) {
+		printf(">>>>> :Init device failed\n");
+	}
+
+	/* step3 bbc */
+	config_h264_encoder();
+
+	ret = v4l2_stream_on();
+	if (ret < 0) {
+		printf(">>>>> :v4l2_stream_on failed\n");
+	}
+
+	for(i = 0; i < 2000; i++) 
+	{
+		/* first record time */
+		if(cnt ==0)
+			start = clock();
+
+		/* step4 bbc */
+		ret = v4l2_dqbuf(fps_value);
+		if (ret < 0) {
+			printf(">>>>> :v4l2_dqbuf failed\n");
+		}
+
+		/* back queue buffer */
+		v4l2_qbuf(ret);
+
+		/* 60fps record time */
+		if(cnt ==60){
+			cnt =0;
+			stop = clock();
+    		float end = (float)(stop - start)/CLOCKS_PER_SEC;
+    		printf("\n>>>>> :60fps'time comsumption is %f\n\n", end);	
+		}
+	}
+
+	printf(">>>>> :cnt = %d\n", cnt);
+	ret = v4l2_stream_off();
+	if (ret < 0) {
+		printf(">>>>> :v4l2_stream_off failed\n");
+	}
+
+	/* step6 bbc */
+	libveENC_exit(&pVideoEnc);
+    handleAfterJob();
+	return 0;
+}
+

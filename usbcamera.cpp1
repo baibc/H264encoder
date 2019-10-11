@@ -1,0 +1,642 @@
+/*
+ * Copyright 2011 - Churn Labs, LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * This is mostly based off of the FFMPEG tutorial:
+ * http://dranger.com/ffmpeg/
+ * With a few updates to support Android output mechanisms and to update
+ * places where the APIs have shifted.
+ */
+#include <stdio.h>
+#include <errno.h>
+#include <sys/types.h>	
+#include <sys/stat.h>	
+#include <linux/fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>    
+#include <stdint.h>
+#include <stdlib.h>
+#include <asm/types.h>
+#include <linux/videodev2.h>
+#include <sys/mman.h>
+#include <string.h>
+#include <malloc.h>
+#include <sys/poll.h> //poll()
+#include <linux/fb.h>
+#include <time.h>
+
+/* step1 */
+/* ####################################### */
+#include <include/SoftwareRenderer.h>
+#include <cutils/memory.h>
+#include <utils/Log.h>
+#include <binder/IPCThreadState.h>
+#include <binder/ProcessState.h>
+#include <binder/IServiceManager.h>
+#include <gui/Surface.h>
+#include <gui/SurfaceComposerClient.h>
+#include <gui/ISurfaceComposer.h>
+#include <ui/DisplayInfo.h>
+#include <android/native_window.h>
+#include <media/stagefright/MetaData.h>
+#include <system/window.h>
+#include <ui/GraphicBufferMapper.h>
+#include <media/stagefright/foundation/ADebug.h>
+
+#include <fcntl.h>
+#include "libve_enc.h"
+VencBaseConfig baseConfig;
+VencAllocateBufferParam bufferParam;
+VencHeaderData sps_pps_data;
+VencH264Param h264Param;
+VideoEncoder* pVideoEnc = NULL;
+int bcount=1;
+int fps_value=0;
+int picWidth =0;
+int picHeight =0;
+
+using namespace android;
+static sp<Surface> yuvSurface = NULL;
+static sp<SurfaceControl> surfaceControl = NULL;
+static sp<SurfaceComposerClient> client = NULL;
+//static sp<MetaData> meta = NULL;
+//static sp<SoftwareRenderer> xxxooo = NULL;
+static DisplayInfo dinfo;
+/* ####################################### */
+
+struct fimc_buffer {
+    unsigned char *start;
+    size_t  length;
+};
+
+static int fd = -1;
+struct fimc_buffer *buffers=NULL;
+struct v4l2_buffer v4l2_buf;
+static int bufnum = 1;
+static int mwidth,mheight;
+
+static int fd2 = -1;
+struct fimc_buffer *buffers2=NULL;
+struct v4l2_buffer v4l2_buf2;
+static int bufnum2 = 1;
+static int mwidth2,mheight2;
+
+fd_set fds;
+struct timeval tv;
+
+int fdsret;
+int maxfd = 0;
+int cnt = 0;
+
+static int surfaceRenderInit()
+{
+		// set up the thread-pool
+		sp<ProcessState> proc(ProcessState::self());
+		ProcessState::self()->startThreadPool();
+
+		// create a client to surfaceflinger
+		client = new SurfaceComposerClient();
+		sp<IBinder> dtoken(SurfaceComposerClient::getBuiltInDisplay(
+								ISurfaceComposer::eDisplayIdMain));
+
+		// get the width and height etc informations 
+		status_t status = SurfaceComposerClient::getDisplayInfo(dtoken, &dinfo);
+		printf("w=%d,h=%d,xdpi=%f,ydpi=%f,fps=%f,ds=%f\n", 
+						dinfo.w, dinfo.h, dinfo.xdpi, dinfo.ydpi, dinfo.fps, dinfo.density);
+		if (status)  return -1;
+
+		// create the new surface
+		surfaceControl = client->createSurface(String8("showYUV"),
+						dinfo.w, dinfo.h, PIXEL_FORMAT_RGBA_8888, 0);
+
+		SurfaceComposerClient::openGlobalTransaction();
+		surfaceControl->setLayer(100000); 
+		surfaceControl->setPosition(0, 0);
+		surfaceControl->setSize(picWidth, picHeight);
+		SurfaceComposerClient::closeGlobalTransaction();
+		yuvSurface = surfaceControl->getSurface();
+
+		/*meta = new MetaData;
+		meta->setInt32(kKeyWidth, picWidth);
+		meta->setInt32(kKeyHeight, picHeight);
+		meta->setInt32(kKeyColorFormat, OMX_COLOR_FormatYUV420Planar);
+		meta->setRect(kKeyCropRect, 0, 0, picWidth -1, picHeight -1);
+		xxxooo = new SoftwareRenderer(yuvSurface,meta);*/
+		return 0;
+}
+
+static int ALIGN(int x, int y) {
+        return (x + y - 1) & ~(y - 1);
+}
+static void nativeWindowRender(const void *data, const sp<ANativeWindow> &nativeWindow, int width, int height)
+{
+    	sp<ANativeWindow> mNativeWindow = nativeWindow;
+		int err;
+		int mCropWidth = width;
+		int mCropHeight = height;
+
+		int halFormat = HAL_PIXEL_FORMAT_YV12;
+		int bufWidth  = (mCropWidth + 1) & ~1;
+		int bufHeight = (mCropHeight + 1) & ~1;
+
+		CHECK_EQ(0,
+            	native_window_set_usage(
+				mNativeWindow.get(),
+            	GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_OFTEN
+            	| GRALLOC_USAGE_HW_TEXTURE  | GRALLOC_USAGE_EXTERNAL_DISP));
+
+		CHECK_EQ(0,
+            	native_window_set_scaling_mode(
+				mNativeWindow.get(),
+            	NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW));
+
+		CHECK_EQ(0, native_window_set_buffers_geometry(
+				mNativeWindow.get(),
+				bufWidth,
+				bufHeight,
+				halFormat));
+
+		ANativeWindowBuffer *buf; 
+		if ((err = native_window_dequeue_buffer_and_wait(mNativeWindow.get(), &buf)) != 0){  
+				ALOGW("Surface::dequeueBuffer returned error %d", err);  
+				return;  
+		}  
+		GraphicBufferMapper &mapper = GraphicBufferMapper::get();
+    	Rect bounds(mCropWidth, mCropHeight);
+
+		void *dst;
+    	CHECK_EQ(0, mapper.lock(
+				buf->handle, GRALLOC_USAGE_SW_WRITE_OFTEN, bounds, &dst));
+
+        const uint8_t *src_y = (const uint8_t *)data;
+        const uint8_t *src_u = (const uint8_t *)data + width * height;
+        const uint8_t *src_v = src_u + (width / 2 * height / 2);
+
+        uint8_t *dst_y = (uint8_t *)dst;
+        size_t dst_y_size = buf->stride * buf->height;
+        size_t dst_c_stride = ALIGN(buf->stride / 2, 16);
+        size_t dst_c_size = dst_c_stride * buf->height / 2;
+        uint8_t *dst_v = dst_y + dst_y_size;
+        uint8_t *dst_u = dst_v + dst_c_size;
+
+        for (int y = 0; y < mCropHeight; ++y) {
+            memcpy(dst_y, src_y, mCropWidth);
+
+            src_y += width;
+            dst_y += buf->stride;
+        }
+
+        for (int y = 0; y < (mCropHeight + 1) / 2; ++y) {
+            memcpy(dst_u, src_u, (mCropWidth + 1) / 2);
+            memcpy(dst_v, src_v, (mCropWidth + 1) / 2);
+
+            src_u += width / 2;
+            src_v += width / 2;
+            dst_u += dst_c_stride;
+            dst_v += dst_c_stride;
+        }
+
+		CHECK_EQ(0, mapper.unlock(buf->handle));
+		if ((err = mNativeWindow->queueBuffer(mNativeWindow.get(), buf,	-1)) != 0){
+				ALOGW("Surface::queueBuffer returned error %d", err);
+		}
+		buf = NULL;
+		return;
+}
+
+/*
+ *open usb camera device
+ */
+int open_init(int devid)
+{
+		const char *devname;
+		struct v4l2_input inp;
+		switch(devid){
+				case 0:
+						devname = "/dev/video0";
+						break;
+				case 1:
+						devname = "/dev/video1";
+						break;
+				case 2:
+						devname = "/dev/video2";
+						break;
+				case 3:
+						devname = "/dev/video3";
+						break;
+				default:
+						devname = "/dev/video1";
+						break;
+		}
+		fd = open(devname, O_RDWR, 0);
+		if (fd < 0)
+				printf("%s ++++ open error\n",devname);
+
+		inp.index = devid;
+		if (-1 == ioctl (fd, VIDIOC_S_INPUT, &inp)){
+				printf("VIDIOC_S_INPUT %d error!\n",devid);
+				return -1;
+		}
+		return fd;
+}
+
+/*
+ * init device
+ */
+int init(int width, int height)
+{
+		mwidth = width;
+		mheight = height;
+		struct v4l2_format fmt;	
+		struct v4l2_capability cap;
+
+		clock_t t1, t2, t3, t4;
+		t1 = clock();
+
+		/* set */
+		memset( &fmt, 0, sizeof(struct v4l2_format));
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+		fmt.fmt.pix.width = width;
+		fmt.fmt.pix.height = height;					
+		if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+		{
+				printf("++++%d : set format failed\n",__LINE__);
+				return -1;
+		}
+		t2 = clock();
+		float e1 = (float)(t2 - t1)/CLOCKS_PER_SEC;
+		printf("\n>>> INIT-1 time comsumption is %f\n", e1);
+
+		printf("2..... get the following resolution from sensor after VIDIOC_S_FMT!\n");
+		printf("2..... fmt.fmt.pix.width=%d, fmt.fmt.pix.height=%d\n\n",fmt.fmt.pix.width,fmt.fmt.pix.height);
+
+
+		/* ###################################### */
+		/* step2 *//* 20160418 add */
+		if(width ==1280 && height ==720){
+				picWidth  = 1280;
+				picHeight = 720;
+				fps_value = 60;
+		}else if(width ==1280 && height ==721){
+				picWidth  = 1280;
+				picHeight = 720;
+				fps_value = 50;
+		}else if(width ==1920 && height ==1080){
+				picWidth  = 1920;
+				picHeight = 1080;
+				fps_value = 25;
+		}else if(width ==1360 && height ==768){	
+				picWidth  = 1360;
+				picHeight = 768;
+				fps_value = 60;
+		}
+		/* ###################################### */
+
+		return 0;
+}
+
+int v4l2_request_buffer(int numbuf)
+{
+		int ret, i;
+		bufnum = numbuf;
+
+		//request buffers
+		struct v4l2_requestbuffers req;
+		memset(&req, 0, sizeof(struct v4l2_requestbuffers));
+		req.count = numbuf;
+		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		req.memory = V4L2_MEMORY_MMAP;
+
+		ret = ioctl(fd, VIDIOC_REQBUFS, &req);
+		if (ret < 0) {
+				printf("++++%d : VIDIOC_REQBUFS failed\n",__LINE__);
+				return -1;
+		}
+
+		//printf("%d :numbuf = %d\n",__LINE__, req.count);
+		buffers = (fimc_buffer *)calloc(req.count, sizeof(*buffers));
+		if (!buffers) {
+				printf ("++++%d Out of memory\n",__LINE__);
+				return -1;
+		}
+
+		for(i = 0; i < bufnum; ++i) {
+				memset(&v4l2_buf, 0, sizeof(struct v4l2_buffer));
+				v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+				v4l2_buf.memory = V4L2_MEMORY_MMAP;
+				v4l2_buf.index = i;
+				ret = ioctl(fd , VIDIOC_QUERYBUF, &v4l2_buf);
+				if(ret < 0) {
+						printf("+++%d : VIDIOC_QUERYBUF failed\n",__LINE__);
+						return -1;
+				}
+				buffers[i].length = v4l2_buf.length;
+				if ((buffers[i].start = (unsigned char*)mmap(0, v4l2_buf.length,
+												PROT_READ | PROT_WRITE, MAP_SHARED,
+												fd, v4l2_buf.m.offset)) < 0) {
+						printf("%d : mmap() failed",__LINE__);
+						return -1;
+				}
+		}
+		//t3 = clock();
+		//float e2 = (float)(t3 - t2)/CLOCKS_PER_SEC;
+		//printf(">>> INIT-2 time comsumption is %f\n", e2);
+
+		for (i = 0; i < bufnum; ++i) {
+				memset(&v4l2_buf, 0, sizeof(struct v4l2_buffer));
+				v4l2_buf.index = i;
+				v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+				v4l2_buf.memory = V4L2_MEMORY_MMAP;
+				ret = ioctl(fd, VIDIOC_QBUF, &v4l2_buf);
+				if (ret < 0) {
+						printf("%d : 111VIDIOC_QBUF failed\n",__LINE__);
+						return ret;
+				}
+		}
+		//t4 = clock();
+		//float e3 = (float)(t4 - t3)/CLOCKS_PER_SEC;
+		//printf(">>> INIT-3 time comsumption is %f\n\n", e3);
+
+		return 0;
+}
+
+/*
+ *stream on
+ */
+int streamon(void)
+{
+		int i;
+		int ret;
+		int iType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		ret = ioctl(fd, VIDIOC_STREAMON, &iType);
+		if (ret < 0) {
+				printf("%d : VIDIOC_STREAMON failed\n",__LINE__);
+				return ret;
+		}
+		return 0;
+}
+
+/*
+ *get one frame data
+ */
+int dqbuf(int fps)
+{
+		int ret;	
+		char data[1280*720*3/2];
+		unsigned char dataBuf[1280*720*3/2];
+		v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		v4l2_buf.memory = V4L2_MEMORY_MMAP;
+
+		ret = ioctl(fd, VIDIOC_DQBUF, &v4l2_buf);
+		if (ret < 0) {
+				printf("%s : VIDIOC_DQBUF failed, dropped frame 3\n",__func__);
+				return ret;
+		}
+		cnt++;
+
+		/* ######################################################################################################################## */
+		/* step5 */
+		if(fps ==60){
+			switch(bcount)
+			{
+				case 1: bcount =2;
+						//memcpy(dataBuf, buffers[v4l2_buf.index].start, picWidth*picHeight);
+						//memcpy(dataBuf +picWidth*picHeight, buffers[v4l2_buf.index].start +picWidth*picHeight, picWidth*picHeight/2);
+						//libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+						break;
+				case 2: bcount =3; break;
+				case 3: bcount =4; 
+						//memcpy(dataBuf, buffers[v4l2_buf.index].start, picWidth*picHeight);
+						//memcpy(dataBuf +picWidth*picHeight, buffers[v4l2_buf.index].start +picWidth*picHeight, picWidth*picHeight/2);
+						//libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+						break;
+				case 4: bcount =5; break;
+				case 5: bcount =1; break;
+				}
+		}else if(fps ==50){
+				if((cnt%2)) 
+						libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+		}else if(fps ==25){
+				libveENC_handle(&pVideoEnc, buffers[v4l2_buf.index].start, (unsigned char*)data, &sps_pps_data, &bufferParam);
+		}
+		/* ######################################################################################################################### */
+
+		return v4l2_buf.index;
+}
+
+
+/*
+ *put in frame buffer to queue
+ */
+int qbuf(int index)
+{
+		int ret;
+
+		v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		v4l2_buf.memory = V4L2_MEMORY_MMAP;
+		v4l2_buf.index = index;
+
+		ret = ioctl(fd, VIDIOC_QBUF, &v4l2_buf);
+		if (ret < 0) {
+				printf("%s : VIDIOC_QBUF failed\n",__func__);
+				return ret;
+		}
+		return 0;
+}
+
+
+/*
+ *streamoff
+ */
+int streamoff(void)
+{
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		int ret;
+
+		ret = ioctl(fd, VIDIOC_STREAMOFF, &type);
+		if (ret < 0) {
+				printf("%s : VIDIOC_STREAMOFF failed\n",__func__);
+				return ret;
+		}
+		return 0;
+}
+
+/*
+ *release
+ */
+int release(void)
+{
+		int iType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		int ret;
+		int i;
+
+		ret = ioctl(fd, VIDIOC_STREAMOFF, &iType);
+		if (ret < 0) {
+				printf("%s : VIDIOC_STREAMOFF failed\n",__func__);
+				return ret;
+		}
+
+		for (i = 0; i < bufnum; i++) {
+				ret = munmap(buffers[i].start, buffers[i].length);
+				if (ret < 0) {
+						printf("%s : munmap failed\n",__func__);
+						return ret;
+				}
+		}
+		free (buffers);
+		close(fd);
+		return 0;
+}
+
+
+static int h264_config()
+{
+		/* ######################################################################## */
+		//the basic configration for init encoder
+		memset(&baseConfig, 0 ,sizeof(VencBaseConfig));
+		baseConfig.nInputWidth= picWidth;
+		baseConfig.nInputHeight = picHeight;
+		baseConfig.nStride = picWidth;  //(picWidth + 15) & 0xfffffff0;
+		baseConfig.nDstWidth = picWidth;
+		baseConfig.nDstHeight = picHeight;
+		baseConfig.eInputFormat = VENC_PIXEL_YUV420P;
+
+		//alloc frame memory's configration
+		memset(&bufferParam, 0 ,sizeof(VencAllocateBufferParam));
+		bufferParam.nSizeY = baseConfig.nInputWidth*baseConfig.nInputHeight;
+		bufferParam.nSizeC = baseConfig.nInputWidth*baseConfig.nInputHeight/2;
+		bufferParam.nBufferNum = 4;
+
+		//h264 param
+		h264Param.bEntropyCodingCABAC = 1;
+		h264Param.nBitrate = 2*1024*1024; /* bps */
+		h264Param.nFramerate = 25; /* fps */
+		h264Param.nCodingMode = VENC_FRAME_CODING;
+		h264Param.nMaxKeyInterval = 30;
+		h264Param.sProfileLevel.nProfile = VENC_H264ProfileMain;
+		h264Param.sProfileLevel.nLevel = VENC_H264Level31;
+		h264Param.sQPRange.nMinqp = 10;
+		h264Param.sQPRange.nMaxqp = 40;
+		if(libveENC_init(&pVideoEnc, &baseConfig, &h264Param) != -1){
+				//printf("1.>>>>> libveENC_init done!\n");
+				handleBeforeJob();
+		}
+		/* ########################################################################## */
+		return 0;
+}
+
+
+int main() {
+		int ret;
+		char *p = NULL;
+		clock_t start;
+		clock_t stop;
+		clock_t stop1;
+		clock_t stop2;
+
+		/*sp<ProcessState> proc(ProcessState::self());
+		ProcessState::self()->startThreadPool();
+		sp<SurfaceComposerClient> client = new SurfaceComposerClient();
+		sp<IBinder> dtoken(SurfaceComposerClient::getBuiltInDisplay(
+					ISurfaceComposer::eDisplayIdMain));
+		DisplayInfo dinfo;
+		status_t status = SurfaceComposerClient::getDisplayInfo(dtoken, &dinfo);
+		printf("w=%d,h=%d,xdpi=%f,ydpi=%f,fps=%f,ds=%f\n", 
+					dinfo.w, dinfo.h, dinfo.xdpi, dinfo.ydpi, dinfo.fps, dinfo.density);
+		if (status)  return -1;
+		sp<SurfaceControl> surfaceControl = client->createSurface(String8("showYUV"),
+					dinfo.w, dinfo.h, PIXEL_FORMAT_RGBA_8888, 0);*/
+
+		ret = open_init(0);
+		if (ret < 0) {
+				printf("no this devices\n");
+		}
+
+		start = clock();
+		ret = init(1280, 720);
+		if (ret < 0) {
+				printf("Init device failed\n");
+		}
+		v4l2_request_buffer(10);
+		stop = clock();
+		float end = (float)(stop - start)/CLOCKS_PER_SEC;
+		printf("\n>>> set v4l2_format time comsumption is %f\n", end);
+
+		surfaceRenderInit();
+		/*SurfaceComposerClient::openGlobalTransaction();
+		surfaceControl->setLayer(100000); 
+		surfaceControl->setPosition(0, 0);
+		surfaceControl->setSize(picWidth, picHeight);
+		SurfaceComposerClient::closeGlobalTransaction();
+		sp<Surface> surface = surfaceControl->getSurface();
+
+		sp<MetaData> meta = new MetaData;
+		meta->setInt32(kKeyWidth, picWidth);
+		meta->setInt32(kKeyHeight, picHeight);
+		meta->setInt32(kKeyColorFormat, OMX_COLOR_FormatYUV420Planar);
+		meta->setRect(kKeyCropRect, 0, 0, picWidth -1, picHeight -1);
+		SoftwareRenderer* sr = new SoftwareRenderer(surface,meta);*/
+
+		/* step3 */
+		h264_config();
+
+		ret = streamon();
+		if (ret < 0) {
+				printf("streamon failed\n");
+		}	
+		stop1 = clock();
+		float end1 = (float)(stop1 - stop)/CLOCKS_PER_SEC;
+		printf(">>> \"after init and before dqbuf\" time comsumption is %f\n", end1);
+
+
+		int i;
+		for(i = 0; i < 200000; i++) 
+		{
+				/*if(cnt ==0)
+					start = clock();*/
+
+				/* step4 */
+				ret = dqbuf(fps_value);
+				if (ret < 0) {
+						printf("dqbuf failed\n");
+				}
+
+				//xxxooo->render(buffers[v4l2_buf.index].start, 0, NULL);
+				nativeWindowRender(buffers[v4l2_buf.index].start, yuvSurface, picWidth, picHeight);
+
+				qbuf(ret);
+				/*if(cnt ==60){
+					cnt =0;
+				  	stop2 = clock();
+				  	float end2 = (float)(stop2 - stop1)/CLOCKS_PER_SEC;
+				  	printf(">>> first fps'time comsumption is %f\n\n", end2);	
+				}*/
+		}
+
+		printf("cnt = %d\n", cnt);
+		ret = streamoff();
+		if (ret < 0) {
+				printf("streamoff failed\n");
+		}
+
+		/* ################################### */
+			libveENC_exit(&pVideoEnc);
+			handleAfterJob();
+		/* ################################### */
+		return 0;
+}
+
